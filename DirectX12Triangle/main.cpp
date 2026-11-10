@@ -76,6 +76,15 @@ struct AppInput {
 static AppInput gInput;
 static HWND gHwnd = nullptr;
 static int gWidth = 800, gHeight = 800;
+static bool gMinimized = false;
+static bool gResizePending = false;
+
+// Stops with a readable message instead of dereferencing a null COM pointer.
+static void require(bool ok, const wchar_t* what) {
+    if (ok) return;
+    MessageBoxW(nullptr, what, L"Direct3DCube", MB_OK | MB_ICONERROR);
+    ExitProcess(1);
+}
 
 LRESULT CALLBACK WindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -133,8 +142,13 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_SIZE:
-        gWidth = LOWORD(lParam);
-        gHeight = HIWORD(lParam);
+        // The swap chain and depth buffer are resized by the render loop.
+        gMinimized = (wParam == SIZE_MINIMIZED);
+        if (!gMinimized && (LOWORD(lParam) != gWidth || HIWORD(lParam) != gHeight)) {
+            gWidth = LOWORD(lParam);
+            gHeight = HIWORD(lParam);
+            gResizePending = true;
+        }
         return 0;
 
     case WM_DESTROY:
@@ -174,8 +188,6 @@ struct VSConstants {
 };
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
-    gWidth = 800; gHeight = 800;
-
     // Window
     WNDCLASS wc = {};
     wc.lpfnWndProc = WindowProc;
@@ -183,14 +195,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     wc.lpszClassName = L"D3D12Cube";
     RegisterClass(&wc);
 
+    // Size the window so the drawable client area, not the outer frame, is 800x800.
+    RECT windowRect{ 0, 0, 800, 800 };
+    AdjustWindowRect(&windowRect, WS_OVERLAPPEDWINDOW, FALSE);
     gHwnd = CreateWindow(wc.lpszClassName, L"Cube",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-        gWidth, gHeight, nullptr, nullptr, hInstance, nullptr);
+        windowRect.right - windowRect.left, windowRect.bottom - windowRect.top,
+        nullptr, nullptr, hInstance, nullptr);
+    require(gHwnd != nullptr, L"Could not create the window.");
     ShowWindow(gHwnd, nCmdShow);
+    {
+        RECT client{};
+        GetClientRect(gHwnd, &client);
+        if (client.right > 0 && client.bottom > 0) { gWidth = client.right; gHeight = client.bottom; }
+    }
 
     // Device
     ID3D12Device* device = nullptr;
     HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
+    require(SUCCEEDED(hr) && device, L"No Direct3D 12 capable graphics device was found.");
 
     // Queue/allocator/list
     ID3D12CommandQueue* command_queue = nullptr;
@@ -224,9 +247,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     IDXGISwapChain* temp_sc = nullptr;
     hr = factory->CreateSwapChain(command_queue, &scd, &temp_sc);
+    require(SUCCEEDED(hr) && temp_sc, L"Could not create the swap chain.");
     IDXGISwapChain3* swap_chain = nullptr;
     temp_sc->QueryInterface(IID_PPV_ARGS(&swap_chain));
     temp_sc->Release();
+    require(swap_chain != nullptr, L"IDXGISwapChain3 is not available.");
+    gResizePending = false; // the swap chain already matches the client area
 
     // RTVs
     ID3D12DescriptorHeap* rtv_heap = nullptr;
@@ -238,14 +264,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     }
     ID3D12Resource* backbuffers[2] = {};
     UINT rtvInc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    {
+    // Also called after the swap chain is resized.
+    auto createRenderTargetViews = [&]() {
         D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap->GetCPUDescriptorHandleForHeapStart();
         for (UINT i = 0; i < 2; ++i) {
             hr = swap_chain->GetBuffer(i, IID_PPV_ARGS(&backbuffers[i]));
+            require(SUCCEEDED(hr), L"Could not access the swap chain buffers.");
             device->CreateRenderTargetView(backbuffers[i], nullptr, h);
             h.ptr += rtvInc;
         }
-    }
+        };
+    createRenderTargetViews();
 
     ID3D12DescriptorHeap* dsv_heap = nullptr;
     {
@@ -256,7 +285,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     }
 
     ID3D12Resource* depth = nullptr;
-    {
+    // Also called after a resize: the depth buffer must match the back buffer size.
+    auto createDepthBuffer = [&]() {
         D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
         D3D12_RESOURCE_DESC tex = {};
@@ -275,12 +305,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         hr = device->CreateCommittedResource(
             &hp, D3D12_HEAP_FLAG_NONE, &tex,
             D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&depth));
+        require(SUCCEEDED(hr) && depth, L"Could not create the depth buffer.");
 
         D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {};
         dsv.Format = DXGI_FORMAT_D32_FLOAT;
         dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
         device->CreateDepthStencilView(depth, &dsv, dsv_heap->GetCPUDescriptorHandleForHeapStart());
-    }
+        };
+    createDepthBuffer();
 
     // Fence
     ID3D12Fence* fence = nullptr; UINT64 fenceValue = 0;
@@ -322,6 +354,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     if (ce) { OutputDebugStringA((char*)ce->GetBufferPointer()); ce->Release(); }
     D3DCompileFromFile(L"shader.hlsl", nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &ps, &ce);
     if (ce) { OutputDebugStringA((char*)ce->GetBufferPointer()); ce->Release(); }
+    require(vs && ps, L"Could not compile shader.hlsl.\n\n"
+        L"Run the program from the folder that contains shader.hlsl "
+        L"(Visual Studio does this when you press F5).");
 
     // Input layout for POSITION/COLOR
     D3D12_INPUT_ELEMENT_DESC il[] = {
@@ -347,7 +382,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pso_desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pso_desc.SampleDesc.Count = 1;
-    device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso));
+    hr = device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso));
+    require(SUCCEEDED(hr) && pso, L"Could not create the graphics pipeline state.");
     if (vs) vs->Release();
     if (ps) ps->Release();
 
@@ -462,6 +498,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
             DispatchMessage(&msg);
         }
         if (!running) break;
+
+        // Nothing is visible while minimized; idle instead of rendering to a 0x0 target.
+        if (gMinimized || gWidth <= 0 || gHeight <= 0) {
+            Sleep(16);
+            tPrev = std::chrono::steady_clock::now();
+            continue;
+        }
+
+        // Match the swap chain and depth buffer to the new client size. The GPU is
+        // idle here because every frame ends with waitGPU().
+        if (gResizePending) {
+            gResizePending = false;
+            for (auto*& buffer : backbuffers) { if (buffer) { buffer->Release(); buffer = nullptr; } }
+            if (depth) { depth->Release(); depth = nullptr; }
+            hr = swap_chain->ResizeBuffers(2, gWidth, gHeight, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+            require(SUCCEEDED(hr), L"Could not resize the swap chain.");
+            createRenderTargetViews();
+            createDepthBuffer();
+        }
 
         // --- Time step ---
         auto tNow = std::chrono::steady_clock::now();
